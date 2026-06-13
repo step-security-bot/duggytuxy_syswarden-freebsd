@@ -1,0 +1,30 @@
+syswarden_jail_dolibarr() {
+    # 1. Fail-Fast: Surgical check against discovery engine state
+    if [[ "${SYSW_HAS_DOLIBARR:-false}" != "true" ]] || [[ -z "${SYSW_RCE_LOGS:-}" ]]; then
+        return 0
+    fi
+
+    log "INFO" "Web access logs detected. Enabling Dolibarr ERP Guard."
+
+    # Create Filter for Dolibarr Authentication Failures
+    if [[ ! -f "/usr/local/etc/fail2ban/filter.d/syswarden-dolibarr.conf" ]]; then
+        cat <<'EOF' >/usr/local/etc/fail2ban/filter.d/syswarden-dolibarr.conf
+[Definition]
+# [DEVSECOPS FIX] Bounded the URI parsing to strictly prevent query string ReDoS.
+failregex = ^<HOST> \S+ \S+ (?:\[[^\]]*\]\s+)?"POST [^"]*?(?:/htdocs/index\.php|/index\.php|/api/index\.php/login)[^"]*?" (?:200|401|403)
+ignoreregex = 
+EOF
+    fi
+
+    # Write directly to jail.d
+    cat <<EOF >/usr/local/etc/fail2ban/jail.d/syswarden-dolibarr.conf
+[syswarden-dolibarr]
+enabled  = true
+port     = http,https
+filter   = syswarden-dolibarr
+logpath  = $SYSW_RCE_LOGS
+backend  = auto
+maxretry = 5
+bantime  = 24h
+EOF
+}

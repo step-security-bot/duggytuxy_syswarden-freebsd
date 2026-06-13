@@ -1,0 +1,52 @@
+syswarden_jail_apache() {
+    # 1. Fail-Fast: Verify native daemon execution (FreeBSD) at the absolute top
+    if ! service apache2 onestatus >/dev/null 2>&1 2>/dev/null && ! service httpd onestatus >/dev/null 2>&1 2>/dev/null; then
+        return 0
+    fi
+
+    local APACHE_LOG=""
+    local APACHE_ACCESS=""
+
+    # 2. Dynamic log path discovery based on OS distribution
+    if [[ -f "/var/log/apache2/error.log" ]] && [[ -f "/var/log/apache2/access.log" ]]; then
+        APACHE_LOG="/var/log/apache2/error.log"
+        APACHE_ACCESS="/var/log/apache2/access.log"
+    elif [[ -f "/var/log/httpd/error_log" ]] && [[ -f "/var/log/httpd/access_log" ]]; then
+        APACHE_LOG="/var/log/httpd/error_log"
+        APACHE_ACCESS="/var/log/httpd/access_log"
+    fi
+
+    # 3. Fail-Fast: Ensure logs exist to prevent Fail2ban crash on startup
+    if [[ -z "$APACHE_LOG" ]] || [[ -z "$APACHE_ACCESS" ]]; then
+        return 0
+    fi
+
+    log "INFO" "Apache daemon and logs detected. Enabling Apache Jails."
+
+    # Create Filter for 404/403 scanners (Apache specific)
+    if [[ ! -f "/usr/local/etc/fail2ban/filter.d/apache-scanner.conf" ]]; then
+        cat <<'EOF' >/usr/local/etc/fail2ban/filter.d/apache-scanner.conf
+[Definition]
+# [DEVSECOPS FIX] Included HTTP 30x redirects and dynamic [A-Z]+ verbs to catch all evasive vulnerability scanners
+failregex = ^<HOST> \S+ \S+ (?:\[[^\]]*\]\s+)?"[A-Z]+ [^"]*?" (?:30[1278]|400|401|403|404|405)
+ignoreregex = 
+EOF
+    fi
+
+    cat <<EOF >/usr/local/etc/fail2ban/jail.d/apache.conf
+[apache-auth]
+enabled  = true
+port     = http,https
+logpath  = $APACHE_LOG
+backend  = auto
+
+[apache-scanner]
+enabled  = true
+port     = http,https
+filter   = apache-scanner
+logpath  = $APACHE_ACCESS
+backend  = auto
+maxretry = 15
+bantime  = 24h
+EOF
+}

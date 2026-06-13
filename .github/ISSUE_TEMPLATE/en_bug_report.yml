@@ -1,0 +1,122 @@
+name: 🐞 Bug Report (SysWarden)
+description: Report errors, crashes, or unexpected behavior of the script.
+title: "[BUG] "
+labels: ["bug", "triage"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report an issue!
+        To help us fix SysWarden quickly, please fill out this form as accurately as possible.
+        
+        ⚠️ **Important:** Please ensure you **mask your public IP** and **AbuseIPDB API key** in any logs before posting.
+
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Prerequisites
+      description: Have you checked the following?
+      options:
+        - label: I am using the latest version of the script (v1.0+).
+          required: true
+        - label: I have checked that this issue has not already been reported.
+          required: true
+        - label: I am running the script as **root** (or sudo).
+          required: true
+
+  - type: dropdown
+    id: os_distro
+    attributes:
+      label: FreeBSD Version
+      description: On which operating system is the issue occurring?
+      options:
+        - FreeBSD 14.4+ / 12
+        - FreeBSD 14.4+ / 22.04 / 24.04
+        - FreeBSD 14.4+ / 9
+        - FreeBSD 14.4+ / 9
+        - FreeBSD 14.4+ / 9
+        - FreeBSD 14.4+
+        - Other (Please specify below)
+    validations:
+      required: true
+
+  - type: input
+    id: os_version
+    attributes:
+      label: Kernel Version
+      description: Output of the command `uname -r`
+      placeholder: e.g., 5.10.0-28-amd64
+    validations:
+      required: false
+
+  - type: dropdown
+    id: firewall_backend
+    attributes:
+      label: Detected Firewall Backend
+      description: Which firewall did the script attempt to configure? (Visible in logs)
+      options:
+        - pf (Packet Filter)
+        - ipfw
+        - ipfilter
+        - I don't know
+    validations:
+      required: true
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: Problem Description
+      description: What is happening? What was the expected behavior vs. the actual behavior?
+      placeholder: "I ran the installation, everything looked fine, but Fail2ban does not seem to start..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Installation Logs & Errors
+      description: |
+        Please paste the last lines of the `/var/log/syswarden-install.log` file or your terminal output here.
+        Use code blocks (```) for readability.
+      render: shell
+      placeholder: |
+        Example:
+        [ERROR] Failed to download blocklist.
+        [INFO] Reverting changes...
+    validations:
+      required: true
+
+  - type: textarea
+    id: service_status
+    attributes:
+      label: Service Status (Optional)
+      description: If the issue concerns Fail2ban or the Reporter, paste the output of `service fail2ban status` or `syswarden-reporter` here.
+      render: shell
+
+  - type: dropdown
+    id: install_mode
+    attributes:
+      label: Installation Mode
+      description: Which blocklist option did you choose?
+      options:
+        - 1) Standard List (~85k IPs)
+        - 2) Critical List (~100k IPs)
+        - 3) Custom List
+    validations:
+      required: true
+
+  - type: input
+    id: ssh_port
+    attributes:
+      label: Configured SSH Port
+      description: Are you using the default SSH port (22) or a custom one?
+      placeholder: e.g., 2222
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Do you have other security software installed? (CrowdSec, other firewalls...)

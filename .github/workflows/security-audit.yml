@@ -1,0 +1,127 @@
+name: SysWarden Security Audit
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - '**.sh'
+      - '**.py'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ "main", "master" ]
+    paths:
+      - '**.sh'
+      - '**.py'
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    name: Code Hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run ShellCheck on Bash scripts
+        # --shell=bash: Forces Bash mode analysis to compensate for missing shebangs in modules
+        # --exclude=SC2034,SC2154: Disables false positives related to cross-file variables
+        run: find . -type f -name "*.sh" -exec shellcheck --shell=bash --exclude=SC2034,SC2154 --severity=warning {} +
+
+      - name: Setup shfmt
+        uses: mfinelli/setup-shfmt@a25fda4c1fe115aec0f85e04126610841bc3141d #v4
+        
+      - name: Check Bash formatting (shfmt)
+        run: shfmt -d -i 4 -ci .
+
+  anti-leaks:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e #v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sast:
+    name: SAST & Supply Chain Security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Generate SBOM (SPDX format)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'spdx-json'
+          output: 'syswarden-sbom.spdx.json'
+
+      - name: Store SBOM Artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: syswarden-sbom
+          path: syswarden-sbom.spdx.json
+          retention-days: 90
+
+      - name: Run Trivy Vulnerability Scanner (SARIF output)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  provenance-attestation:
+    name: Generate Build Provenance
+    needs: [hygiene, anti-leaks, sast]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Compile Modular Source Code
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Bundle Compiled SysWarden Scripts
+        run: tar -czvf syswarden-release.tar.gz -C dist .
+
+      - name: Generate Artifact Attestation
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: 'syswarden-release.tar.gz'
+          
+      - name: Upload Attested Artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: syswarden-attested-bundle
+          path: syswarden-release.tar.gz

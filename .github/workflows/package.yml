@@ -1,0 +1,98 @@
+name: SysWarden Builder and Packager
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'src/**'
+      - 'build.sh'
+      - 'syswarden-auto.conf'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-package:
+    name: Compile and Build Packages
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Compile Universal Script
+        run: |
+          # Ensure script is executable and run the compiler
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Extract Version from Config
+        id: version
+        run: |
+          # Parse the version from syswarden-auto.conf securely
+          VERSION=$(grep -oP '^# Version=v\K[0-9\.]+' syswarden-auto.conf || echo "0.0.0")
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Set up Ruby for FPM
+        uses: ruby/setup-ruby@12fd324f1d0b43274fdc8130f6980590a667c455 # v1.312.0
+        with:
+          ruby-version: '3.2'
+
+      - name: Install FPM build tools
+        run: |
+          # Install Effing Package Management without docs for speed
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev rubygems build-essential
+          sudo gem install --no-document fpm
+          gem install --no-document fpm
+
+      - name: Prepare Staging Environment
+        run: |
+          # Create standard FreeBSD filesystem hierarchy for the deployment package
+          mkdir -p staging/opt/syswarden
+          mkdir -p staging/usr/local/bin
+
+          # Copy the compiled artifact and the unattended configuration
+          cp dist/install-syswarden.sh staging/opt/syswarden/
+          cp syswarden-auto.conf staging/opt/syswarden/
+
+          # Apply strict execution permissions (Root execution only)
+          chmod 750 staging/opt/syswarden/install-syswarden.sh
+          chmod 640 staging/opt/syswarden/syswarden-auto.conf
+
+          # Create a symlink for global execution from the terminal
+          ln -s /opt/syswarden/install-syswarden.sh staging/usr/local/bin/syswarden
+
+      - name: Build FreeBSD Package (.pkg)
+        run: |
+          fpm -s dir -t freebsd \
+            -n syswarden \
+            -v ${{ env.VERSION }} \
+            --vendor "SysWarden Security" \
+            --maintainer "SysWarden Engineering" \
+            --description "SysWarden Host-based Security Orchestrator for FreeBSD" \
+            --url "https://github.com/${{ github.repository }}" \
+            --architecture all \
+            -C staging .
+
+
+      - name: Generate Checksums
+        run: |
+          # Generate SHA256 checksums for integrity verification (Supply Chain Security)
+          sha256sum *.pkg > SHA256SUMS.txt
+
+      - name: Upload Package Artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: syswarden-packages-${{ env.VERSION }}
+          path: |
+            *.pkg
+            SHA256SUMS.txt
+          retention-days: 7

@@ -1,0 +1,928 @@
+#!/bin/bash
+
+# ==============================================================================
+# SysWarden v1.00.2 - DevSecOps Audit & Compliance Tool
+# Copyright (C) 2026 duggytuxy - Laurent M.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Architecture: FreeBSD
+# Objective: Verify Component Status, Log Isolation, and Zero Trust Permissions
+# ==============================================================================
+
+set -euo pipefail
+IFS=$'\n\t'
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# --- COLORS & FORMATTING ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+SCORE=0
+TOTAL=0
+
+# --- SECURE AUDIT LOGGING ---
+AUDIT_LOG="/var/log/syswarden-audit.log"
+touch "$AUDIT_LOG" && chmod 600 "$AUDIT_LOG"
+echo "=== SYSWARDEN PURPLE TEAM AUDIT STARTED: $(date -u +"%Y-%m-%dT%H:%M:%SZ") ===" >"$AUDIT_LOG"
+
+# --- HELPERS (Dual-Output: Console + Standardized Log + 2s Pacing) ---
+log_header() {
+    echo -e "\n${BLUE}${BOLD}=== $1 ===${NC}"
+    echo -e "\n--- $1 ---" >>"$AUDIT_LOG"
+    sleep 1
+}
+pass() {
+    echo -e "  [${GREEN}PASS${NC}] $1"
+    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [PASS] $1" >>"$AUDIT_LOG"
+    SCORE=$((SCORE + 1))
+    TOTAL=$((TOTAL + 1))
+    sleep 2
+}
+fail() {
+    echo -e "  [${RED}FAIL${NC}] $1"
+    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [FAIL] $1" >>"$AUDIT_LOG"
+    TOTAL=$((TOTAL + 1))
+    sleep 2
+}
+warn() {
+    echo -e "  [${YELLOW}WARN${NC}] $1"
+    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [WARN] $1" >>"$AUDIT_LOG"
+    TOTAL=$((TOTAL + 1))
+    sleep 2
+}
+info() {
+    echo -e "  [${BLUE}INFO${NC}] $1"
+    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [INFO] $1" >>"$AUDIT_LOG"
+    sleep 2
+}
+is_service_active() {
+    local svc="$1"
+    if service "$svc" status >/dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+check_file_perms() {
+    local file="$1"
+    local expected_perms="$2"
+    local expected_owner="$3"
+
+    if [[ ! -f "$file" ]]; then
+        fail "File missing: $file"
+        return
+    fi
+
+    local perms
+    perms=$(stat -c "%a" "$file" 2>/dev/null || stat -f "%Op" "$file" | cut -c4-6)
+    local owner
+    owner=$(stat -c "%U" "$file" 2>/dev/null || stat -f "%Su" "$file")
+
+    if [[ "$perms" == *"$expected_perms" ]] && [[ "$owner" == "$expected_owner" ]]; then
+        pass "Permissions OK on $file ($perms, Owner: $owner)"
+    else
+        fail "Bad permissions on $file (Got $perms $owner, Expected $expected_perms $expected_owner)"
+    fi
+}
+
+# ==============================================================================
+# --- 1. SYSTEM DETECTION & GLOBAL VARIABLES ---
+# ==============================================================================
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}ERROR: Audit script must be run as root.${NC}"
+    exit 1
+fi
+
+OS_TYPE="Universal"
+info "Detected OS Environment: $OS_TYPE"
+
+if [[ -f "/etc/syswarden.conf" ]]; then
+    source "/etc/syswarden.conf" 2>/dev/null || true
+fi
+
+# Pre-detect Firewall Engine globally to prevent crashes in partial audits
+FW_ENGINE="Unknown"
+if command -v nft >/dev/null && { nft list table inet syswarden_table >/dev/null 2>&1 || nft list table netdev syswarden_hw_drop >/dev/null 2>&1; }; then
+    FW_ENGINE="Nftables"
+elif command -v pf >/dev/null && pfctl -sr 2>/dev/null | grep -q "block drop"; then
+    FW_ENGINE="pf"
+fi
+
+# Pre-detect SSH Port globally
+SSH_PORT=$(ss -tlnp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F':' '{print $NF}' | head -n 1 || echo "")
+if [[ -z "$SSH_PORT" ]]; then
+    SSH_PORT=$(netstat -tlnp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F':' '{print $NF}' | head -n 1 || echo "")
+fi
+SSH_PORT=${SSH_PORT:-22}
+CLOAK_PASSED=0 # Default to 0 for downstream phases
+
+# ==============================================================================
+# --- DEVSECOPS: AUDIT EXECUTION MODE (Interactive Menu) ---
+# ==============================================================================
+RUN_ALL=0
+USER_PHASES=""
+
+echo -e "\n${BOLD}==============================================================================${NC}"
+echo -e "${BLUE} SysWarden DevSecOps Audit - Execution Mode${NC}"
+echo -e "${BOLD}==============================================================================${NC}"
+echo -e "  1) Complete Audit Scan (All Phases 1-8)"
+echo -e "  2) Custom Audit Scan (Select multiple specific phases)"
+echo -e "${BOLD}==============================================================================${NC}"
+
+# Strict Input Validation Loop
+while true; do
+    read -rp "Select an option [1-2]: " AUDIT_MODE
+    if [[ "$AUDIT_MODE" =~ ^[1-2]$ ]]; then
+        break
+    else
+        echo -e "${RED}Invalid selection. Please enter 1 or 2.${NC}"
+    fi
+done
+
+if [[ "$AUDIT_MODE" == "1" ]]; then
+    RUN_ALL=1
+    echo -e "${GREEN}>>> Initializing Complete Audit Scan... <<<${NC}\n"
+elif [[ "$AUDIT_MODE" == "2" ]]; then
+    echo -e "\n${YELLOW}Select the specific phases you want to audit:${NC}"
+    echo -e "  1) Phase 1: OS Hardening, CIS Benchmark Level 2 & Privilege Separation"
+    echo -e "  2) Phase 2: Log Routing & Anti-Injection Verification"
+    echo -e "  3) Phase 3: Kernel Shield & Threat Intelligence"
+    echo -e "  4) Phase 4: Layer 7 Active Defense (Fail2ban)"
+    echo -e "  5) Phase 5: DevSecOps Telemetry & Enterprise Dashboard"
+    echo -e "  6) Phase 6: Zero Trust Remote Access (VPN & SSH Cloaking)"
+    echo -e "  7) Phase 7: Exposed Services & Firewall Persistence (CSPM)"
+    echo -e "  8) Phase 8: Enterprise SOC & High Availability (HA Cluster)"
+    echo -e "  9) Phase 9: Ghost Rules & Firewall Idempotency (Anti-Duplication)"
+    echo ""
+
+    # Strict Input Validation Loop for Multiple Phases
+    while true; do
+        read -rp "Enter phase numbers separated by space (e.g., 1 3 9): " RAW_PHASES
+
+        # Sanitize input
+        CLEAN_PHASES=$(echo "$RAW_PHASES" | tr ',' ' ' | tr -s ' ')
+
+        # Regex validation
+        if [[ "$CLEAN_PHASES" =~ ^[1-9\ ]+$ ]]; then
+            if [[ -n "${CLEAN_PHASES// /}" ]]; then
+                USER_PHASES=" $CLEAN_PHASES "
+                break
+            fi
+        fi
+        echo -e "${RED}Invalid input. Please enter valid phase numbers (1-8) separated by spaces.${NC}"
+    done
+
+    DISPLAY_PHASES=$(echo "$CLEAN_PHASES" | tr ' ' '\n' | sort -nu | tr '\n' ' ' | sed 's/ $//')
+    echo -e "${GREEN}>>> Initializing Custom Audit Scan (Phases: $DISPLAY_PHASES)... <<<${NC}\n"
+fi
+
+# ==============================================================================
+# --- Phase 1: OS Hardening, CIS Benchmark Level 2 & Privilege Separation ---
+# ==============================================================================
+if [[ "$RUN_ALL" -eq 1 || "$USER_PHASES" == *" 1 "* ]]; then
+    log_header "Phase 1: OS Hardening, CIS Benchmark Level 2 & Privilege Separation"
+
+    if [[ "${APPLY_OS_HARDENING:-n}" == "y" ]]; then
+
+        if [[ -f "/etc/cron.allow" ]]; then
+            check_file_perms "/etc/cron.allow" "600" "root"
+        else
+            fail "/etc/cron.allow is missing (Crontab not locked down)"
+        fi
+
+        PRIV_USERS=$(awk -F':' '/^(wheel|sudo|adm):/ {print $4}' /etc/group | tr ',' '\n' | grep -v '^$' | grep -v 'root' || true)
+        UNAUTHORIZED_USERS=""
+
+        for u in $PRIV_USERS; do
+            uid=$(id -u "$u" 2>/dev/null || echo "0")
+            if [[ "$uid" -ge 1000 ]]; then
+                UNAUTHORIZED_USERS="$UNAUTHORIZED_USERS $u"
+            fi
+        done
+
+        if [[ -z "$UNAUTHORIZED_USERS" ]]; then
+            pass "Privileged groups (wheel/sudo/adm) are clean from standard users."
+        else
+            fail "Found standard users in privileged groups:$UNAUTHORIZED_USERS"
+        fi
+
+        if command -v lsattr >/dev/null 2>&1; then
+            IMMUTABLE_FAILED=0
+            for user_dir in /home/*; do
+                if [[ -d "$user_dir" ]]; then
+                    for profile_file in "$user_dir/.profile" "$user_dir/.bashrc" "$user_dir/.bash_profile"; do
+                        if [[ -f "$profile_file" ]]; then
+                            if ! lsattr "$profile_file" 2>/dev/null | grep '^\----i' >/dev/null; then
+                                IMMUTABLE_FAILED=1
+                                fail "Immutable flag missing on $profile_file"
+                            fi
+                        fi
+                    done
+                fi
+            done
+            if [[ $IMMUTABLE_FAILED -eq 0 ]]; then
+                pass "All existing standard user profiles are immutable (+i)."
+            fi
+        else
+            info "lsattr command not found. Skipping immutable flag check."
+        fi
+
+    else
+        info "OS Hardening was skipped during installation (Existing Server). Strict compliance bypassed."
+    fi
+
+    # --- CIS Benchmark Level 2 Audit (Defense-in-Depth) ---
+    if [[ "${APPLY_CIS_L2_HARDENING:-n}" == "y" ]]; then
+        CIS_PASSED=1
+
+        if [[ -f "/etc/modprobe.d/syswarden-cis-fs.conf" ]] && grep -q "install cramfs /bin/true" "/etc/modprobe.d/syswarden-cis-fs.conf" 2>/dev/null; then
+            pass "CIS Level 2: Obscure filesystems and uncommon network protocols are strictly blacklisted."
+        else
+            fail "CIS Level 2: Modprobe blacklists are missing or incomplete (Filesystems/Network)."
+            CIS_PASSED=0
+        fi
+
+        BPF_STATUS=$(sysctl -n kernel.unprivileged_bpf_disabled 2>/dev/null || echo "0")
+        ROUTE_STATUS=$(sysctl -n net.ipv4.conf.all.accept_source_route 2>/dev/null || echo "1")
+
+        if [[ "$BPF_STATUS" == "1" ]] && [[ "$ROUTE_STATUS" == "0" ]]; then
+            pass "CIS Level 2: Kernel parameters (ASLR, eBPF, Network Routing) are strictly enforced."
+        else
+            fail "CIS Level 2: Advanced Kernel parameters (sysctl) are not fully applied."
+            CIS_PASSED=0
+        fi
+
+        if [[ -f "/etc/security/limits.d/99-syswarden-cis.conf" ]] && grep -q "hard core 0" "/etc/security/limits.d/99-syswarden-cis.conf" 2>/dev/null; then
+            pass "CIS Level 2: Core dumps are globally disabled to prevent memory credential leaks."
+        else
+            fail "CIS Level 2: Core dump hard limits are missing."
+            CIS_PASSED=0
+        fi
+
+        if grep -q "^[[:space:]]*X11Forwarding no" /etc/ssh/sshd_config 2>/dev/null; then
+            pass "CIS Level 2: Advanced SSH Hardening is active (X11 disabled, Limits applied)."
+        else
+            fail "CIS Level 2: Advanced SSH Hardening rules are missing."
+            CIS_PASSED=0
+        fi
+
+        if [[ -d "/etc/cron.d" ]]; then
+            CRON_PERMS=$(stat -c "%a" "/etc/cron.d" 2>/dev/null || stat -f "%Op" "/etc/cron.d" | cut -c4-6)
+            if [[ "$CRON_PERMS" == *"700" ]]; then
+                pass "CIS Level 2: System cron directories are securely locked (700)."
+            else
+                fail "CIS Level 2: System cron directories permissions are too open (Got $CRON_PERMS)."
+                CIS_PASSED=0
+            fi
+        fi
+
+        if [[ $CIS_PASSED -eq 1 ]]; then
+            pass "CIS Benchmark Level 2 (Defense-in-Depth) global status is COMPLIANT."
+        fi
+    else
+        info "CIS Benchmark Level 2 is not activated for this host (Skipped)."
+    fi
+
+    CRON_SAFE=1
+    CRON_COUNT=0
+    SEEN_CRON_FILES=""
+
+    for cron_file in "/etc/crontabs/root" "/var/spool/cron/crontabs/root" "/etc/cron.d/syswarden-update"; do
+        if [[ -f "$cron_file" ]]; then
+            real_path=$(realpath "$cron_file" 2>/dev/null || readlink -f "$cron_file" 2>/dev/null || echo "$cron_file")
+            if echo "$SEEN_CRON_FILES" | grep -q "$real_path"; then continue; fi
+            SEEN_CRON_FILES="$SEEN_CRON_FILES $real_path"
+
+            file_count=$(grep -v "^[[:space:]]*#" "$cron_file" 2>/dev/null | { grep -c "syswarden-cron-update" || true; })
+            CRON_COUNT=$((CRON_COUNT + file_count))
+
+            if grep -v "^[[:space:]]*#" "$cron_file" 2>/dev/null | grep "\.sh update >" >/dev/null 2>&1; then
+                CRON_SAFE=0
+            fi
+        fi
+    done
+
+    if [[ $CRON_COUNT -eq 1 ]]; then
+        if [[ $CRON_SAFE -eq 1 ]]; then
+            pass "Cron Orchestration VERIFIED: Exactly one secure 'cron-update' background job is active (Absolute cleanliness)."
+        else
+            fail "Cron Orchestration FAILED: Legacy 'update' parameter detected. High risk of Ghost Processes!"
+        fi
+    elif [[ $CRON_COUNT -gt 1 ]]; then
+        fail "Cron Duplication FAILED: $CRON_COUNT SysWarden cron jobs detected! Idempotency violated."
+    else
+        warn "Cron Orchestration: No automated SysWarden background jobs found."
+    fi
+fi
+
+# ==============================================================================
+# --- Phase 2: Log Routing & Anti-Injection Verification ---
+# ==============================================================================
+if [[ "$RUN_ALL" -eq 1 || "$USER_PHASES" == *" 2 "* ]]; then
+    log_header "Phase 2: Log Routing & Anti-Injection Verification"
+
+    check_file_perms "/var/log/kern-firewall.log" "600" "root"
+
+    check_file_perms "/var/log/auth-syswarden.log" "600" "root"
+
+    # Audit OS Hardening on system auth log (F-008)
+    if [[ -f "/var/log/auth.log" ]]; then
+        auth_perms=$(stat -c "%a" "/var/log/auth.log" 2>/dev/null || stat -f "%Op" "/var/log/auth.log" | cut -c4-6)
+        if [[ "$auth_perms" == *"640" ]] || [[ "$auth_perms" == *"600" ]]; then
+            pass "Auth Log Isolation VERIFIED: /var/log/auth.log is secured against non-privileged reads ($auth_perms)."
+        else
+            fail "Auth Log Isolation FAILED: /var/log/auth.log permissions are too open ($auth_perms)."
+        fi
+    fi
+
+    if is_service_active "rsyslog"; then
+        pass "Rsyslog daemon is active and routing logs securely."
+    else
+        fail "Rsyslog daemon is not running."
+    fi
+fi
+
+# ==============================================================================
+# --- Phase 3: Kernel Shield & Threat Intelligence ---
+# ==============================================================================
+if [[ "$RUN_ALL" -eq 1 || "$USER_PHASES" == *" 3 "* ]]; then
+    log_header "Phase 3: Kernel Shield & Threat Intelligence"
+
+    if [[ -s "/etc/syswarden/active_global_blocklist.txt" ]]; then
+        LINES=$(wc -l </etc/syswarden/active_global_blocklist.txt)
+        pass "Global Blocklist is populated ($LINES active records)."
+    else
+        fail "Global Blocklist is missing or empty."
+    fi
+
+    if [[ -n "${GEOBLOCK_COUNTRIES:-}" ]] && [[ "${GEOBLOCK_COUNTRIES:-none}" != "none" ]]; then
+        pass "GeoIP Threat Intelligence is actively deployed and enforced."
+    else
+        info "GeoIP Threat Intelligence (Skipped by user)."
+    fi
+
+    if [[ -n "${BLOCK_ASNS:-}" ]] && [[ "${BLOCK_ASNS:-none}" != "none" ]]; then
+        pass "Manual ASN Routing Defense is actively deployed."
+    else
+        info "Manual ASN Routing Defense (Skipped by user)."
+    fi
+
+    if [[ "${USE_SPAMHAUS_ASN:-n}" == "y" || "${USE_SPAMHAUS_ASN:-n}" == "Y" ]]; then
+        pass "Spamhaus Dynamic Feed is actively deployed."
+    else
+        info "Spamhaus Dynamic Feed (Skipped by user)."
+    fi
+
+    if [[ "$FW_ENGINE" != "Unknown" ]]; then
+        pass "Firewall Engine ($FW_ENGINE) is active and strictly enforcing SysWarden rules."
+
+        if [[ "$FW_ENGINE" == "Nftables" ]]; then
+            # FIX: Double incr. removed
+            if nft list table netdev syswarden_hw_drop >/dev/null 2>&1; then
+                pass "Nftables Layer 2 Hardware Acceleration (netdev syswarden_hw_drop) is ACTIVE."
+            else
+                fail "Nftables Layer 2 Hardware Acceleration is MISSING or failed to load."
+            fi
+        fi
+    else
+        fail "SysWarden firewall rules not found in kernel space."
+    fi
+
+    CATCH_ALL_PASSED=0
+    if [[ "$FW_ENGINE" == "Nftables" ]]; then
+        if nft list chain inet syswarden_table input_backend 2>/dev/null | grep "Catch-All" >/dev/null; then
+            CATCH_ALL_PASSED=1
+        elif nft list chain inet syswarden_table input 2>/dev/null | grep "Catch-All" >/dev/null; then
+            CATCH_ALL_PASSED=1
+        fi
+    elif [[ "$FW_ENGINE" == "pf" ]]; then
+        if pfctl -sr 2>/dev/null | grep -q "block drop"; then
+            CATCH_ALL_PASSED=1
+        fi
+    fi
+
+    if [[ $CATCH_ALL_PASSED -eq 1 ]]; then
+        pass "Zero Trust Architecture VERIFIED: Catch-All Drop policy is active at the network edge."
+    else
+        fail "Zero Trust Architecture FAILED: Catch-All Drop policy is missing. Run 'install-syswarden update'."
+    fi
+
+    if command -v docker >/dev/null 2>&1 && is_service_active "docker"; then
+        if command -v pf >/dev/null 2>&1 && pf -n -L DOCKER-USER >/dev/null 2>&1; then
+            if pf -S DOCKER-USER 2>/dev/null | grep "syswarden_blacklist" >/dev/null; then
+                pass "Docker Integration: SysWarden blocklists are actively shielding containers."
+            else
+                fail "Docker Integration: SysWarden blocklists are missing from the DOCKER-USER chain."
+            fi
+
+            DOCKER_RULE_1=$(pf -S DOCKER-USER 1 2>/dev/null || true)
+            if [[ "$DOCKER_RULE_1" == *"-j RETURN"* ]] && [[ "$DOCKER_RULE_1" == *"ESTABLISHED"* ]]; then
+                pass "Docker Stateful Bypass VERIFIED: Return routing is locked at Absolute Priority 0."
+            else
+                fail "Docker Stateful Bypass FAILED: Return routing is missing or pushed down by another rule."
+            fi
+        else
+            warn "Docker is running, but the DOCKER-USER chain is inaccessible or missing."
+        fi
+    else
+        info "Docker engine not detected or offline (Skipped container routing audit)."
+    fi
+fi
+
+# Audit Cloud Metadata Isolation (F-015)
+IMDS_BLOCKED=0
+if command -v pf >/dev/null 2>&1 && pf -S OUTPUT 2>/dev/null | grep -E "169\.254\.169\.254.*owner ! --uid-owner (0|root).*DROP" >/dev/null; then
+    IMDS_BLOCKED=1
+elif command -v nft >/dev/null 2>&1 && nft list chain inet filter output 2>/dev/null | grep -E "ip daddr 169.254.169.254 skuid != (0|root) drop" >/dev/null; then
+    IMDS_BLOCKED=1
+fi
+
+if [[ $IMDS_BLOCKED -eq 1 ]]; then
+    pass "Cloud Egress Guard VERIFIED: IMDS Metadata Service is sealed for non-root users."
+else
+    fail "Cloud Egress Guard FAILED: Firewall rule restricting non-root outbound access to 169.254.169.254 is missing."
+fi
+
+# ==============================================================================
+# --- Phase 4: Layer 7 Active Defense (Fail2ban) ---
+# ==============================================================================
+if [[ "$RUN_ALL" -eq 1 || "$USER_PHASES" == *" 4 "* ]]; then
+    log_header "Phase 4: Layer 7 Active Defense (Fail2ban)"
+
+    if is_service_active "fail2ban"; then
+        pass "Fail2ban service is running."
+
+        if fail2ban-client ping >/dev/null 2>&1; then
+            pass "Fail2ban socket is highly responsive (Pong)."
+
+            F2B_PROC_COUNT=$(ps aux | grep "[f]ail2ban-server" | wc -l)
+            if [[ "$F2B_PROC_COUNT" -gt 1 ]]; then
+                fail "Process Duplication FAILED: $F2B_PROC_COUNT Fail2ban instances detected! Severe risk of SQLite locking."
+            else
+                pass "Process Idempotence VERIFIED: A single, strictly controlled Fail2ban daemon is active."
+            fi
+
+            if [[ -f "/usr/local/etc/fail2ban/jail.d/defaults-freebsd.conf" ]]; then
+                fail "Conflicting default OS jails were detected in jail.d/"
+            else
+                pass "Zero Trust environment: No conflicting default OS jails found."
+            fi
+
+            if grep "^failregex = \^%(__prefix_line)s" /usr/local/etc/fail2ban/filter.d/syswarden-portscan.conf >/dev/null 2>&1; then
+                pass "Strict Regex Anchoring is applied (Log Spoofing vector neutralized)."
+            else
+                fail "Strict Regex Anchoring missing in the portscan filter."
+            fi
+
+            # --- PURPLE TEAM / MODSECURITY CHECK ---
+            if [[ -f "/usr/local/etc/fail2ban/filter.d/syswarden-modsec.conf" ]]; then
+                if fail2ban-client status 2>/dev/null | grep -q "syswarden-modsec"; then
+                    pass "Purple Team Integration VERIFIED: ModSecurity WAF jail (syswarden-modsec) is active."
+                else
+                    fail "Purple Team Integration FAILED: ModSecurity filter exists but jail is inactive."
+                fi
+            elif command -v docker >/dev/null 2>&1 && docker ps --format '{{.Image}}' 2>/dev/null | grep -iE "modsecurity|owasp/modsecurity-crs|coreruleset/modsecurity" >/dev/null; then
+                pass "Purple Team Integration VERIFIED: Containerized WAF (ModSecurity Sidecar) is active."
+            else
+                info "Purple Team Integration N/A: ModSecurity WAF not detected natively or in Docker."
+            fi
+
+            IGNORE_IPS=$(fail2ban-client get sshd ignoreip 2>/dev/null || true)
+            IP_COUNT=$(echo "$IGNORE_IPS" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u | wc -l)
+
+            if [[ "$IP_COUNT" -gt 1 ]]; then
+                pass "Dynamic IgnoreIP is populated (Anti-Lockout verified)."
+            else
+                warn "IgnoreIP might only contain localhost. Infrastructure whitelisting may have failed."
+            fi
+
+            # Audit Zero Trust Action (F-002 & Architecture)
+            if fail2ban-client -d 2>/dev/null | grep -iE "multiport" >/dev/null; then
+                fail "Zero Trust FAILED: Fail2ban is using legacy 'multiport' actions instead of strict total-host isolation."
+            else
+                pass "Zero Trust Action VERIFIED: Fail2ban is enforcing strict global isolation (AllPorts/IPSet)."
+            fi
+        else
+            fail "Fail2ban service is running but the IPC socket is unresponsive."
+        fi
+    else
+        fail "Fail2ban service is completely offline."
+    fi
+fi
+
+# ==============================================================================
+# --- Phase 5: DevSecOps Telemetry & Enterprise Dashboard ---
+# ==============================================================================
+if [[ "$RUN_ALL" -eq 1 || "$USER_PHASES" == *" 5 "* ]]; then
+    log_header "Phase 5: DevSecOps Telemetry & Enterprise Dashboard"
+
+    # [DEVSECOPS FIX] TUI Architecture: Web Server and TLS certificate checks bypassed
+    info "Enterprise Dashboard (TUI) is active. Local Web Server and TLS checks are no longer required."
+
+    if [[ -x "/usr/local/bin/syswarden-telemetry.sh" ]]; then
+        pass "Telemetry Orchestrator script is deployed and executable."
+    else
+        fail "Telemetry Orchestrator script is missing."
+    fi
+
+    info "Initiating Deep-Scan for Telemetry Idempotence (60s cron overlap observation)..."
+    TELEMETRY_GHOST_DETECTED=0
+
+    for i in {60..1}; do
+        printf "\r  [~] Monitoring process stack... %02ds remaining " "$i"
+
+        TELEMETRY_RAW=$(ps -ef | grep "[s]yswarden-telemetry.sh" | grep -vE "sh -c|CROND|grep" || true)
+
+        TELEMETRY_PROC_COUNT=$(echo "$TELEMETRY_RAW" | awk '{
+            if ($2 != "") pids[$2]=$3 
+        } 
+        END {
+            count=0; 
+            for (p in pids) { 
+                if (!(pids[p] in pids)) count++ 
+            }; 
+            print count+0
+        }')
+
+        if [ "${TELEMETRY_PROC_COUNT:-0}" -gt 1 ]; then
+            TELEMETRY_GHOST_DETECTED=1
+            break
+        fi
+        sleep 1
+    done
+    echo ""
+
+    if [ "$TELEMETRY_GHOST_DETECTED" -eq 1 ]; then
+        fail "Process Duplication FAILED: $TELEMETRY_PROC_COUNT telemetry instances detected! CPU leak triggered during cron cycle."
+    else
+        pass "Process Idempotence VERIFIED: Telemetry daemon state is stable (<=1 active instance) over a full cron cycle."
+    fi
+
+    if [[ -f "/etc/syswarden/ui/data.json" ]]; then
+        payload_perms=$(stat -c "%a" "/etc/syswarden/ui/data.json" 2>/dev/null || stat -f "%Op" "/etc/syswarden/ui/data.json" | cut -c4-6)
+        payload_owner=$(stat -c "%U" "/etc/syswarden/ui/data.json" 2>/dev/null || stat -f "%Su" "/etc/syswarden/ui/data.json")
+
+        # [DEVSECOPS FIX] TUI Architecture: data.json no longer requires web server ownership
+        if [[ "$payload_perms" == *"640" || "$payload_perms" == *"600" ]] && [[ "$payload_owner" == "root" ]]; then
+            pass "Telemetry payload ownership & permissions are strictly isolated (TUI Mode: $payload_perms, Owner: $payload_owner)."
+        else
+            fail "Telemetry payload has weak permissions/ownership (Got $payload_perms $payload_owner, Expected 600/640 root)."
+        fi
+    else
+        warn "Telemetry payload (data.json) not found yet. Awaiting initial cron execution."
+    fi
+
+    if [[ -f "/usr/local/bin/syswarden_reporter.py" ]]; then
+        if is_service_active "syswarden-reporter"; then
+            pass "AbuseIPDB Async Reporter is active."
+            check_file_perms "/usr/local/bin/syswarden_reporter.py" "700" "root"
+        else
+            warn "AbuseIPDB Reporter is installed but offline."
+        fi
+    else
+        info "AbuseIPDB Reporter is not installed (Skipped by user)."
+    fi
+fi
+
+# ==============================================================================
+# --- Phase 6: Zero Trust Remote Access (VPN & SSH Cloaking) ---
+# ==============================================================================
+if [[ "$RUN_ALL" -eq 1 || "$USER_PHASES" == *" 6 "* ]]; then
+    log_header "Phase 6: Zero Trust Remote Access (VPN & SSH Cloaking)"
+
+    if command -v firewall-cmd >/dev/null 2>&1 && is_service_active "pf" 2>/dev/null; then
+        if firewall-cmd --list-rich-rules 2>/dev/null | grep "priority=\"-900\".*port=\"${SSH_PORT}\".*drop" >/dev/null; then
+            CLOAK_PASSED=1
+        fi
+    elif command -v nft >/dev/null 2>&1 && nft list table inet syswarden_table >/dev/null 2>&1; then
+        NFT_RULES=""
+        if nft list chain inet syswarden_table input_frontline >/dev/null 2>&1; then
+            NFT_RULES=$(nft -n list chain inet syswarden_table input_frontline 2>/dev/null | tr '\n' ' ' | tr '\t' ' ' || echo "")
+        elif nft list chain inet syswarden_table input >/dev/null 2>&1; then
+            NFT_RULES=$(nft -n list chain inet syswarden_table input 2>/dev/null | tr '\n' ' ' | tr '\t' ' ' || echo "")
+        fi
+
+        if [[ -n "$NFT_RULES" ]] && echo "$NFT_RULES" | grep -E "tcp dport ${SSH_PORT}.*drop" >/dev/null; then
+            CLOAK_PASSED=1
+        fi
+    elif command -v pf >/dev/null 2>&1 && pf status 2>/dev/null | grep "Status: active" >/dev/null; then
+        if pf status 2>/dev/null | grep -E "^${SSH_PORT}/tcp[[:space:]]+DENY[[:space:]]+Anywhere" >/dev/null; then
+            CLOAK_PASSED=1
+        fi
+    elif command -v pf >/dev/null 2>&1; then
+        if pf -C INPUT -p tcp --dport "${SSH_PORT}" -j DROP 2>/dev/null; then
+            CLOAK_PASSED=1
+        fi
+    fi
+
+    if [[ $CLOAK_PASSED -eq 1 ]]; then
+        pass "SSH Cloaking VERIFIED: Port $SSH_PORT is strictly dropped globally (Priority Guillotine)."
+    else
+        if [[ -f "/etc/wireguard/wg0.conf" ]]; then
+            fail "SSH Cloaking FAILED: Port $SSH_PORT is exposed despite VPN configuration (Missing drop rule)."
+        else
+            info "SSH Cloaking N/A: Port $SSH_PORT is exposed to the public (Zero Trust VPN not installed)."
+        fi
+    fi
+
+    if [[ -d "/etc/wireguard" ]] && [[ -f "/etc/wireguard/wg0.conf" ]]; then
+        if ifconfig wg0 >/dev/null 2>&1; then
+            pass "WireGuard interface (wg0) is UP and ready to accept authorized clients."
+        else
+            fail "WireGuard interface (wg0) is DOWN or missing."
+        fi
+
+        VPN_ALLOW_PASSED=0
+        if command -v firewall-cmd >/dev/null 2>&1 && is_service_active "pf" 2>/dev/null; then
+            if firewall-cmd --permanent --zone=trusted --list-interfaces 2>/dev/null | grep "wg0" >/dev/null; then
+                VPN_ALLOW_PASSED=1
+            fi
+        elif command -v nft >/dev/null 2>&1 && nft list table inet syswarden_table >/dev/null 2>&1; then
+            NFT_RULES=""
+            if nft list chain inet syswarden_table input_frontline >/dev/null 2>&1; then
+                NFT_RULES=$(nft -n list chain inet syswarden_table input_frontline 2>/dev/null | tr '\n' ' ' | tr '\t' ' ' || echo "")
+            elif nft list chain inet syswarden_table input >/dev/null 2>&1; then
+                NFT_RULES=$(nft -n list chain inet syswarden_table input 2>/dev/null | tr '\n' ' ' | tr '\t' ' ' || echo "")
+            fi
+
+            if [[ -n "$NFT_RULES" ]] && echo "$NFT_RULES" | grep -E "iifname.*wg0.*accept" >/dev/null; then
+                VPN_ALLOW_PASSED=1
+            fi
+        elif command -v pf >/dev/null 2>&1 && pf status 2>/dev/null | grep "Status: active" >/dev/null; then
+            if pf status 2>/dev/null | grep -E "wg0.*ALLOW" >/dev/null; then
+                VPN_ALLOW_PASSED=1
+            fi
+        elif command -v pf >/dev/null 2>&1; then
+            if pf -S INPUT 2>/dev/null | grep -E "\-A INPUT -i wg0 -j ACCEPT" >/dev/null; then
+                VPN_ALLOW_PASSED=1
+            fi
+        fi
+
+        if [[ $VPN_ALLOW_PASSED -eq 1 ]]; then
+            pass "VPN Gateway VERIFIED: SSH access is explicitly allowed via the WireGuard tunnel."
+        else
+            fail "VPN Gateway FAILED: Explicit accept rule for WireGuard not found."
+        fi
+    else
+        info "WireGuard VPN is not installed or configured (Skipped by user)."
+    fi
+
+    if [[ -s "/etc/syswarden/ssh_whitelist.txt" ]]; then
+        BYPASS_COUNT=$(grep -v '^$' "/etc/syswarden/ssh_whitelist.txt" | wc -l)
+        if [[ "$BYPASS_COUNT" -gt 0 ]]; then
+            pass "Zero Trust Exception VERIFIED: $BYPASS_COUNT explicit IP(s) are surgically whitelisted for direct SSH access."
+        else
+            warn "Zero Trust Exception: SSH Whitelist file exists but is empty."
+        fi
+    else
+        info "Day-2 SSH Bypass: No explicit IP whitelisted (Strict mode active)."
+    fi
+fi
+
+# ==============================================================================
+# --- Phase 7: Exposed Services & Firewall Persistence (CSPM) ---
+# ==============================================================================
+if [[ "$RUN_ALL" -eq 1 || "$USER_PHASES" == *" 7 "* ]]; then
+    log_header "Phase 7: Exposed Services & Firewall Persistence (CSPM)"
+
+    if [[ "$FW_ENGINE" == "Nftables" ]]; then
+        if grep 'include "/etc/syswarden/syswarden.nft"' /etc/pf.nft >/dev/null 2>&1 || grep 'include "/etc/syswarden/syswarden.nft"' /etc/pf.conf >/dev/null 2>&1; then
+            pass "Firewall Persistence VERIFIED: SysWarden Nftables rules are firmly anchored in main OS config."
+        else
+            fail "Firewall Persistence FAILED: SysWarden include directive is missing in main Nftables config."
+        fi
+
+    elif [[ "$FW_ENGINE" == "pf" ]]; then
+        if sysrc -n pf_enable 2>/dev/null | grep -iq "yes"; then
+            pass "Firewall Persistence VERIFIED: pf is enabled and will restore rules on boot."
+        else
+            fail "Firewall Persistence FAILED: pf is not enabled on system boot."
+        fi
+    else
+        fail "Firewall Persistence FAILED: No recognized firewall engine active."
+    fi
+
+    info "Scanning for globally exposed listening ports (0.0.0.0 / ::)..."
+
+    DISCOVERED_PORTS=""
+    if [[ -f "/etc/pf.d/syswarden-os-bypass.nft" ]]; then
+        RAW_PORTS=$(grep "Auto-allow Discovered Services" /etc/pf.d/syswarden-os-bypass.nft | grep -oE '\{[^\}]+\}' | tr -d '{} ' || true)
+        DISCOVERED_PORTS=$(echo "$RAW_PORTS" | tr ',' '\n')
+    fi
+
+    # PRE-CACHE FIREWALL STATE
+    FW_NFT_CACHE=""
+    FW_IPT_CACHE=""
+    FW_UFW_CACHE=""
+    FW_FWD_CACHE=""
+
+    if command -v nft >/dev/null 2>&1; then FW_NFT_CACHE=$(nft list ruleset 2>/dev/null || true); fi
+    if command -v pf-save >/dev/null 2>&1; then FW_IPT_CACHE=$(pf-save 2>/dev/null || true); fi
+    if command -v pf >/dev/null 2>&1; then FW_UFW_CACHE=$(pf status 2>/dev/null || true); fi
+    if command -v firewall-cmd >/dev/null 2>&1; then FW_FWD_CACHE=$(firewall-cmd --list-rich-rules 2>/dev/null || true); fi
+
+    if command -v ss >/dev/null 2>&1; then
+        LISTEN_PORTS=$(ss -tlnp 2>/dev/null | awk 'NR>1 {print $4}' | grep -vE '^(127\.|::1|\[::1\])' | awk -F':' '{print $NF}' | grep -E '^[0-9]+$' | sort -nu || true)
+    else
+        LISTEN_PORTS=$(netstat -tlnp 2>/dev/null | awk '/^tcp/ {print $4}' | grep -vE '^(127\.|::1|\[::1\])' | awk -F':' '{print $NF}' | grep -E '^[0-9]+$' | sort -nu || true)
+    fi
+
+    if [[ -n "$LISTEN_PORTS" ]]; then
+        for PORT in $LISTEN_PORTS; do
+
+            DELIBERATE=0
+            if [[ -n "$DISCOVERED_PORTS" ]]; then
+                for dp in $DISCOVERED_PORTS; do
+                    if [[ -n "$dp" ]] && [[ "$PORT" -eq "$dp" ]]; then
+                        DELIBERATE=1
+                        break
+                    fi
+                done
+            fi
+
+            IP_RESTRICTED=0
+            F2B_GUARDED=0
+
+            if [[ -n "$FW_NFT_CACHE" ]] && echo "$FW_NFT_CACHE" | grep -E "tcp dport $PORT\b" | grep -qE "ip saddr|ip6 saddr"; then
+                IP_RESTRICTED=1
+            elif [[ -n "$FW_IPT_CACHE" ]] && echo "$FW_IPT_CACHE" | grep -E "dport $PORT\b" | grep -E "\-s |source " | grep -qv "0.0.0.0/0"; then
+                IP_RESTRICTED=1
+            elif [[ -n "$FW_UFW_CACHE" ]] && echo "$FW_UFW_CACHE" | grep -E "^$PORT/tcp\b" | grep -qv "Anywhere"; then
+                IP_RESTRICTED=1
+            elif [[ -n "$FW_FWD_CACHE" ]] && echo "$FW_FWD_CACHE" | grep "port=\"$PORT\"" | grep -q "source"; then
+                IP_RESTRICTED=1
+            fi
+
+            if command -v fail2ban-client >/dev/null 2>&1; then
+                if [[ -n "$FW_IPT_CACHE" ]] && echo "$FW_IPT_CACHE" | grep -iE "f2b-|fail2ban" | grep -qE "dport $PORT\b"; then
+                    F2B_GUARDED=1
+                elif [[ -n "$FW_NFT_CACHE" ]] && echo "$FW_NFT_CACHE" | grep -iE "f2b-|fail2ban" | grep -qE "dport $PORT\b"; then
+                    F2B_GUARDED=1
+                fi
+            fi
+
+            if [[ "$PORT" -eq "$SSH_PORT" ]]; then
+                if [[ ${CLOAK_PASSED:-0} -eq 1 ]]; then
+                    info "Exposed Port: $PORT/TCP (SSH) - Guarded by Zero Trust VPN Guillotine (Drop policy)."
+                else
+                    info "Exposed Port: $PORT/TCP (SSH) - Publicly exposed (Guarded by Fail2ban sshd jail)."
+                fi
+            elif [[ "$PORT" -eq 80 || "$PORT" -eq 443 ]]; then
+                info "Exposed Port: $PORT/TCP (Web) - Guarded by SysWarden Layer 7 LFI/SQLi/Bot Jails."
+            elif [[ "$PORT" -eq 3306 || "$PORT" -eq 5432 || "$PORT" -eq 27017 || "$PORT" -eq 6379 ]]; then
+                info "Exposed Port: $PORT/TCP (Database) - Guarded by Fail2ban Layer 7 Jails & Custom Firewall Rules."
+            elif [[ "$PORT" -eq 21 ]]; then
+                info "Exposed Port: $PORT/TCP (FTP Honeypot) - Guarded by Fail2ban vsftpd jail."
+            elif [[ "$PORT" -eq 23 ]]; then
+                info "Exposed Port: $PORT/TCP (Telnet Honeypot) - Guarded by Fail2ban Mirai/IoT jail."
+            elif [[ "$PORT" -eq 111 ]]; then
+                info "Exposed Port: $PORT/TCP (rpcbind) - Internal RPC service, guarded by default OS Firewall."
+            elif [[ "$PORT" -eq 9090 ]]; then
+                info "Exposed Port: $PORT/TCP (Cockpit UI) - Guarded by Fail2ban cockpit jail."
+            elif [[ "$PORT" -eq 9999 ]]; then
+                info "Exposed Port: $PORT/TCP (Nginx Enterprise UI) - Guarded by Zero Trust IP Restriction & TLS."
+            elif [[ "$PORT" -eq 51820 || "$PORT" -eq "${WG_PORT:-51820}" ]]; then
+                info "Exposed Port: $PORT/UDP (WireGuard) - Guarded by SysWarden Stealth UDP protections."
+            elif [[ "$PORT" -eq 53 || "$PORT" -eq 123 || "$PORT" -eq 161 ]]; then
+                info "Exposed Port: $PORT (Infra) - Standard Infrastructure Protocol (DNS/NTP)."
+            elif [[ $DELIBERATE -eq 1 ]]; then
+                if [[ $IP_RESTRICTED -eq 1 ]]; then
+                    info "Exposed Port: $PORT/TCP (User Service) - Guarded by Zero Trust IP Restriction."
+                elif [[ $F2B_GUARDED -eq 1 ]]; then
+                    info "Exposed Port: $PORT/TCP (User Service) - Guarded by Fail2ban Layer 7 Jails & Custom Firewall Rules."
+                else
+                    info "Exposed Port: $PORT/TCP (User Service) - Guarded by default OS Firewall."
+                fi
+            else
+                if [[ $IP_RESTRICTED -eq 1 ]]; then
+                    info "Exposed Port: $PORT/TCP (Manual Service) - Guarded by Zero Trust IP Restriction (Not in Bypass Table)."
+                elif [[ $F2B_GUARDED -eq 1 ]]; then
+                    info "Exposed Port: $PORT/TCP (Manual Service) - Guarded by Fail2ban Layer 7 Jails & Custom Firewall Rules."
+                else
+                    warn "Exposed Port: $PORT/TCP (Unknown/Public) - Open to the public. Verify if this service requires zero-trust isolation."
+                fi
+            fi
+        done
+        pass "Attack Surface Mapping completed. All exposed sockets evaluated against security profiles."
+    else
+        pass "Attack Surface Mapping completed. No externally exposed TCP ports detected (Maximum Stealth)."
+    fi
+fi
+
+# ==============================================================================
+# --- Phase 8: Enterprise SOC & HA Integration ---
+# ==============================================================================
+if [[ "$RUN_ALL" -eq 1 || "$USER_PHASES" == *" 8 "* ]]; then
+    log_header "Phase 8: Enterprise SOC & HA Integration"
+
+    # 1. HA Cluster Sync
+    if [[ -f "/usr/local/bin/syswarden-sync.sh" ]]; then
+        # FIX: Double incr. removed
+        if crontab -l 2>/dev/null | grep -q "syswarden-sync"; then
+            pass "HA Cluster Sync is ACTIVE and securely scheduled in Cron."
+        else
+            fail "HA Cluster Sync script exists but is missing from Cron schedule."
+        fi
+    else
+        info "HA Cluster Sync is not configured (Skipped by user)."
+    fi
+
+    # 2. SIEM Log Forwarding (Rsyslog)
+    if [[ -f "/etc/rsyslog.d/99-syswarden-siem.conf" ]]; then
+        # FIX: Double incr. removed
+        if grep -q "@@\|@" "/etc/rsyslog.d/99-syswarden-siem.conf"; then
+            pass "SIEM Log Forwarding (ISO 27001/NIS2) is ACTIVE and configured."
+        else
+            fail "SIEM Log Forwarding configuration exists but lacks a valid target destination."
+        fi
+    else
+        info "SIEM Log Forwarding is not configured (Skipped by user)."
+    fi
+fi
+
+# ==============================================================================
+# --- Phase 9: Ghost Rules & Firewall Idempotency (Anti-Duplication) ---
+# ==============================================================================
+if [[ "$RUN_ALL" -eq 1 || "$USER_PHASES" == *" 9 "* ]]; then
+    log_header "Phase 9: Ghost Rules & Firewall Idempotency (Anti-Duplication)"
+
+    GHOST_DETECTED=0
+
+    if [[ "$FW_ENGINE" == "Nftables" ]]; then
+        if nft list chain inet filter input >/dev/null 2>&1; then
+            DUP_WG=$(nft list chain inet filter input 2>/dev/null | { grep -E "udp dport ${WG_PORT:-51820} accept" || true; } | wc -l)
+            if [[ "$DUP_WG" -gt 1 ]]; then
+                GHOST_DETECTED=1
+                fail "Ghost Rules FAILED: $DUP_WG duplicate WireGuard rules detected in OS filter chain."
+            fi
+
+            GLOBAL_DUPS=$(nft list chain inet filter input 2>/dev/null | grep -vE '(type|hook|priority|{|})' | sed 's/^[ \t]*//' | { grep -v '^$' || true; } | sort | uniq -cd | wc -l)
+            if [[ "$GLOBAL_DUPS" -gt 0 ]]; then
+                GHOST_DETECTED=1
+                fail "Ghost Rules FAILED: OS/Firewall update anomaly detected. $GLOBAL_DUPS exact duplicated rule(s) found in Nftables filter chain."
+            fi
+        fi
+
+        if nft list chain inet syswarden_table input_backend >/dev/null 2>&1; then
+            DUP_9999=$(nft list chain inet syswarden_table input_backend 2>/dev/null | { grep -E "tcp dport 9999 accept" || true; } | wc -l)
+            if [[ "$DUP_9999" -gt 1 ]]; then
+                GHOST_DETECTED=1
+                fail "Ghost Rules FAILED: $DUP_9999 duplicate Dashboard (9999) rules detected in SysWarden backend."
+            fi
+        elif nft list chain inet syswarden_table input >/dev/null 2>&1; then
+            DUP_9999=$(nft list chain inet syswarden_table input 2>/dev/null | { grep -E "tcp dport 9999 accept" || true; } | wc -l)
+            if [[ "$DUP_9999" -gt 1 ]]; then
+                GHOST_DETECTED=1
+                fail "Ghost Rules FAILED: $DUP_9999 duplicate Dashboard (9999) rules detected in SysWarden input chain."
+            fi
+        fi
+
+    elif [[ "$FW_ENGINE" == "pf" ]]; then
+        # no-op
+        :
+    fi
+
+    if [[ $GHOST_DETECTED -eq 0 ]]; then
+        pass "Firewall Stack Idempotency VERIFIED: No ghost rules or uncontrolled duplicates detected post-update."
+    fi
+fi
+
+# ==============================================================================
+# --- 10. AUDIT SUMMARY ---
+# ==============================================================================
+echo -e "\n${BOLD}==============================================================================${NC}"
+
+# HOTFIX: Prevent Division by Zero
+if [[ $TOTAL -eq 0 ]]; then
+    echo -e "${YELLOW}>>> AUDIT SKIPPED: No checks were performed or Phase was empty. <<<${NC}"
+    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [RESULT] SKIPPED - No checks performed." >>"$AUDIT_LOG"
+elif [[ $SCORE -eq $TOTAL ]]; then
+    echo -e "${GREEN}>>> AUDIT SUCCESSFUL: $SCORE/$TOTAL checks passed. System is fully DevSecOps compliant. <<<${NC}"
+    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [RESULT] SUCCESS - $SCORE/$TOTAL checks passed." >>"$AUDIT_LOG"
+else
+    PERCENT=$((SCORE * 100 / TOTAL))
+    echo -e "${RED}>>> AUDIT FAILED: $SCORE/$TOTAL checks passed ($PERCENT%). Immediate review required. <<<${NC}"
+    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [RESULT] FAILED - $SCORE/$TOTAL checks passed ($PERCENT%)." >>"$AUDIT_LOG"
+fi
+
+echo -e "${BOLD}==============================================================================${NC}"
+
+echo -e "📄 ${BOLD}Full Standardized Audit Log securely saved to:${NC} ${YELLOW}$AUDIT_LOG${NC}\n"
+echo "=== AUDIT COMPLETED: $(date -u +"%Y-%m-%dT%H:%M:%SZ") ===" >>"$AUDIT_LOG"

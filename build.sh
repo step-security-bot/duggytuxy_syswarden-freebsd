@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# SysWarden Micro-Modular Compiler
+# Compiles individual function scripts into a single universal deployment artifact.
+
+set -euo pipefail
+# [DEVSECOPS FIX] Prevent literal string expansion if a target module directory is empty
+shopt -s nullglob
+
+DIST_DIR="dist"
+OUTPUT="${DIST_DIR}/install-syswarden.sh"
+
+echo "[*] Initializing SysWarden Universal Build..."
+mkdir -p "${DIST_DIR}"
+: >"${OUTPUT}"
+
+# ==========================================
+# 1. BASE SECURITY HEADERS
+# ==========================================
+cat <<'EOF' >"${OUTPUT}"
+#!/bin/bash
+# SysWarden - Enterprise Compiled Build
+# Copyright (C) 2026 duggytuxy - Laurent M.
+#
+# --- STRICT RUNTIME ENVIRONMENT ---
+set -euo pipefail
+IFS=$'\n\t'
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+EOF
+
+# ==========================================
+# 2. INJECT CORE CONFIGURATION
+# ==========================================
+echo "[*] Injecting core configurations..."
+for file in src/core/*.sh; do
+    if [[ -f "$file" ]]; then
+        echo "# --- SOURCE: $(basename "$file") ---" >>"${OUTPUT}"
+        cat "$file" >>"${OUTPUT}"
+        # [DEVSECOPS FIX] Predictable POSIX formatting over echo -e to prevent unintended escapes
+        printf "\n\n" >>"${OUTPUT}"
+    fi
+done
+
+# ==========================================
+# 3. INJECT UNIVERSAL FUNCTIONS
+# ==========================================
+echo "[*] Injecting universal modules..."
+for file in src/universel/*.sh; do
+    if [[ -f "$file" ]]; then
+        echo "# --- SOURCE: $(basename "$file") ---" >>"${OUTPUT}"
+        cat "$file" >>"${OUTPUT}"
+        # [DEVSECOPS FIX] Predictable POSIX formatting over echo -e to prevent unintended escapes
+        printf "\n\n" >>"${OUTPUT}"
+    fi
+done
+
+# ==========================================
+# 4. INJECT MODULAR FAIL2BAN JAILS
+# ==========================================
+echo "[*] Injecting modular Fail2ban jails..."
+if [[ -d "src/jails" ]]; then
+    for file in src/jails/*.sh; do
+        if [[ -f "$file" ]]; then
+            echo "# --- SOURCE: $(basename "$file") ---" >>"${OUTPUT}"
+            cat "$file" >>"${OUTPUT}"
+            # [DEVSECOPS FIX] Predictable POSIX formatting over echo -e to prevent unintended escapes
+            printf "\n\n" >>"${OUTPUT}"
+        fi
+    done
+else
+    echo "[-] WARNING: src/jails directory not found. Skipping jail modules."
+fi
+
+# ==========================================
+# 5. INJECT MAIN ORCHESTRATOR
+# ==========================================
+echo "[*] Injecting main orchestrator..."
+if [[ -f "src/main.sh" ]]; then
+    echo "# --- SOURCE: main.sh ---" >>"${OUTPUT}"
+    cat "src/main.sh" >>"${OUTPUT}"
+else
+    echo "[-] CRITICAL: src/main.sh not found. Build aborted." >&2
+    exit 1
+fi
+
+chmod +x "${OUTPUT}"
+echo "[+] Build complete. Artifact generated at: ${OUTPUT}"
