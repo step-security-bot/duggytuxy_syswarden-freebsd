@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   plumber:
-    runs-on: FreeBSD 14.4+
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write   # required to upload SARIF to Code Scanning
