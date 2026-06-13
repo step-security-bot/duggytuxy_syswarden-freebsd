@@ -53,9 +53,9 @@ detect_backend() {
     elif command -v pf >/dev/null && pf status | grep -q "Status: active"; then
         FW_BACKEND="pf"
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        FW_BACKEND="pf"
+        FW_BACKEND="firewalld"
     elif command -v nft >/dev/null 2>&1 && nft list table inet syswarden_table >/dev/null 2>&1; then
-        FW_BACKEND="pf"
+        FW_BACKEND="nftables"
     elif command -v ipset >/dev/null 2>&1 && ipset list "$SET_NAME" >/dev/null 2>&1; then
         FW_BACKEND="ipset"
     else
@@ -160,14 +160,14 @@ check_ip() {
     echo -n "[Kernel]  L3 Whitelist     : "
     local is_whitelisted_fw=false
     case "$FW_BACKEND" in
-        pf)
+        nftables)
             if [[ "$target_ip" =~ : ]]; then
                 if nft get element netdev syswarden_hw_drop syswarden_whitelist6 "{ $target_ip }" >/dev/null 2>&1; then is_whitelisted_fw=true; fi
             else
                 if nft get element netdev syswarden_hw_drop syswarden_whitelist "{ $target_ip }" >/dev/null 2>&1; then is_whitelisted_fw=true; fi
             fi
             ;;
-        pf)
+        firewalld)
             local family="ipv4"
             [[ "$target_ip" =~ : ]] && family="ipv6"
             local ACTIVE_ZONE
@@ -183,7 +183,7 @@ check_ip() {
                 is_whitelisted_fw=true
             fi
             ;;
-        ipset | pf | unknown)
+        ipset | iptables | unknown)
             if [[ "$target_ip" =~ : ]]; then
                 if ip6tables -C INPUT -s "$target_ip" -j ACCEPT >/dev/null 2>&1; then is_whitelisted_fw=true; fi
             else
@@ -203,10 +203,10 @@ check_ip() {
     local is_blocked_fw=false
 
     case "$FW_BACKEND" in
-        pf)
+        nftables)
             if nft get element netdev syswarden_hw_drop "$SET_NAME" "{ $target_ip }" >/dev/null 2>&1; then is_blocked_fw=true; fi
             ;;
-        pf | ipset | pf | pf)
+        ipset | iptables | unknown)
             if ipset test "$SET_NAME" "$target_ip" >/dev/null 2>&1; then is_blocked_fw=true; fi
             ;;
     esac
@@ -257,14 +257,14 @@ unblock_ip() {
     fi
 
     case "$FW_BACKEND" in
-        pf)
+        nftables)
             nft delete element netdev syswarden_hw_drop "$SET_NAME" "{ $target_ip }" 2>/dev/null || true
             ;;
-        pf)
+        firewalld)
             firewall-cmd --permanent --ipset="$SET_NAME" --remove-entry="$target_ip" >/dev/null 2>&1 || true
             ipset del "$SET_NAME" "$target_ip" 2>/dev/null || true
             ;;
-        ipset | pf | pf)
+        ipset | iptables | unknown)
             ipset del "$SET_NAME" "$target_ip" 2>/dev/null || true
             ;;
     esac
@@ -316,7 +316,7 @@ whitelist_ip() {
     fi
 
     case "$FW_BACKEND" in
-        pf)
+        nftables)
             # Aligning with SysWarden v1.00.2 O(1) set-based whitelist architecture
             if [[ "$target_ip" =~ : ]]; then
                 nft add element netdev syswarden_hw_drop syswarden_whitelist6 "{ $target_ip }" 2>/dev/null || true
@@ -332,7 +332,7 @@ whitelist_ip() {
                 nft list table inet syswarden_table 2>/dev/null
             } >/etc/syswarden/syswarden.nft
             ;;
-        pf)
+        firewalld)
             local family="ipv4"
             [[ "$target_ip" =~ : ]] && family="ipv6"
             local ACTIVE_ZONE
@@ -343,7 +343,7 @@ whitelist_ip() {
         pf)
             pf insert 1 allow from "$target_ip" >/dev/null 2>&1 || true
             ;;
-        ipset | pf | unknown)
+        ipset | iptables | unknown)
             if [[ "$target_ip" =~ : ]]; then
                 ip6tables -I INPUT 1 -s "$target_ip" -j ACCEPT 2>/dev/null || true
                 if command -v netfilter-persistent >/dev/null; then
@@ -456,7 +456,7 @@ unwhitelist_ip() {
     fi
 
     case "$FW_BACKEND" in
-        pf)
+        nftables)
             if [[ "$target_ip" =~ : ]]; then
                 nft delete element netdev syswarden_hw_drop syswarden_whitelist6 "{ $target_ip }" 2>/dev/null || true
             else
@@ -478,7 +478,7 @@ unwhitelist_ip() {
                 nft list table inet syswarden_table 2>/dev/null
             } >/etc/syswarden/syswarden.nft
             ;;
-        pf)
+        firewalld)
             local family="ipv4"
             [[ "$target_ip" =~ : ]] && family="ipv6"
             local ACTIVE_ZONE
@@ -489,7 +489,7 @@ unwhitelist_ip() {
         pf)
             pf delete allow from "$target_ip" >/dev/null 2>&1 || true
             ;;
-        ipset | pf | unknown)
+        ipset | iptables | unknown)
             if [[ "$target_ip" =~ : ]]; then
                 ip6tables -D INPUT -s "$target_ip" -j ACCEPT 2>/dev/null || true
                 if command -v netfilter-persistent >/dev/null; then
@@ -590,7 +590,7 @@ allow_ssh_ip() {
 
     # 2. Kernel Injection
     case "$FW_BACKEND" in
-        pf)
+        nftables)
             get_nft_chain
             local family_rule="ip"
             [[ "$target_ip" =~ : ]] && family_rule="ip6"
@@ -601,7 +601,7 @@ allow_ssh_ip() {
                 nft list table inet syswarden_table 2>/dev/null
             } >/etc/syswarden/syswarden.nft
             ;;
-        pf)
+        firewalld)
             local family="ipv4"
             [[ "$target_ip" =~ : ]] && family="ipv6"
             local ACTIVE_ZONE
@@ -612,7 +612,7 @@ allow_ssh_ip() {
         pf)
             pf insert 1 allow from "$target_ip" to any port "$SSH_PORT" proto tcp >/dev/null 2>&1 || true
             ;;
-        ipset | pf | unknown)
+        ipset | iptables | unknown)
             if [[ "$target_ip" =~ : ]]; then
                 ip6tables -I INPUT 1 -p tcp -s "$target_ip" --dport "$SSH_PORT" -j ACCEPT 2>/dev/null || true
                 if command -v netfilter-persistent >/dev/null; then
@@ -664,7 +664,7 @@ revoke_ssh_ip() {
 
     # 2. Kernel Extraction
     case "$FW_BACKEND" in
-        pf)
+        nftables)
             get_nft_chain
             local family_rule="ip"
             [[ "$target_ip" =~ : ]] && family_rule="ip6"
@@ -681,7 +681,7 @@ revoke_ssh_ip() {
                 nft list table inet syswarden_table 2>/dev/null
             } >/etc/syswarden/syswarden.nft
             ;;
-        pf)
+        firewalld)
             local family="ipv4"
             [[ "$target_ip" =~ : ]] && family="ipv6"
             local ACTIVE_ZONE
@@ -692,7 +692,7 @@ revoke_ssh_ip() {
         pf)
             pf delete allow from "$target_ip" to any port "$SSH_PORT" proto tcp >/dev/null 2>&1 || true
             ;;
-        ipset | pf | unknown)
+        ipset | iptables | unknown)
             if [[ "$target_ip" =~ : ]]; then
                 while ip6tables -D INPUT -p tcp -s "$target_ip" --dport "$SSH_PORT" -j ACCEPT 2>/dev/null; do :; done
                 if command -v netfilter-persistent >/dev/null; then
@@ -737,14 +737,14 @@ block_ip() {
     fi
 
     case "$FW_BACKEND" in
-        pf)
+        nftables)
             nft add element netdev syswarden_hw_drop "$SET_NAME" "{ $target_ip }" 2>/dev/null || true
             ;;
-        pf)
+        firewalld)
             firewall-cmd --permanent --ipset="$SET_NAME" --add-entry="$target_ip" >/dev/null 2>&1 || true
             ipset add "$SET_NAME" "$target_ip" 2>/dev/null || true
             ;;
-        ipset | pf | pf)
+        ipset | iptables | unknown)
             ipset add "$SET_NAME" "$target_ip" 2>/dev/null || true
             ;;
     esac
@@ -862,7 +862,7 @@ list_ips() {
     detect_backend
     echo -e "\n${BLUE}[ Active Kernel Firewall Stats ($FW_BACKEND) ]${NC}"
     case "$FW_BACKEND" in
-        pf)
+        nftables)
             local blacklist_cnt whitelist_cnt whitelist6_cnt
             blacklist_cnt=$(nft list set netdev syswarden_hw_drop syswarden_blacklist 2>/dev/null | grep -A 9999 "elements = {" | grep -v -E "elements = \{|\}" | grep -v "^[[:space:]]*$" | wc -l || echo "0")
             whitelist_cnt=$(nft list set netdev syswarden_hw_drop syswarden_whitelist 2>/dev/null | grep -A 9999 "elements = {" | grep -v -E "elements = \{|\}" | grep -v "^[[:space:]]*$" | wc -l || echo "0")
@@ -871,7 +871,7 @@ list_ips() {
             echo "  -> Active Whitelisted IPv4 (L2 Ingress): $whitelist_cnt"
             echo "  -> Active Whitelisted IPv6 (L2 Ingress): $whitelist6_cnt"
             ;;
-        pf | ipset | pf | pf)
+        ipset | iptables | unknown)
             local entry_cnt="0"
             if command -v ipset >/dev/null 2>&1; then
                 entry_cnt=$(ipset list "$SET_NAME" 2>/dev/null | grep -i "Number of entries:" | awk '{print $NF}' || echo "0")

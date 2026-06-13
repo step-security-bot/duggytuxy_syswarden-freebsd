@@ -20,7 +20,7 @@ uninstall_syswarden() {
     local members
 
     if [[ -f "$CONF_FILE" ]]; then
-        source "$CONF_FILE"
+        # shellcheck source=/dev/null        source "$CONF_FILE"
     fi
 
     log "INFO" "Sending SIGTERM to gracefully shutdown background processes..."

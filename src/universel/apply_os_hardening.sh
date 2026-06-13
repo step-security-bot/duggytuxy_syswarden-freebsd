@@ -23,6 +23,7 @@ apply_os_hardening() {
         current_admin=$(who am i | awk '{print $1}' 2>/dev/null || true)
     fi
 
+    # shellcheck disable=SC2043
     for grp in wheel; do
         if pw group show "$grp" >/dev/null 2>&1; then
             # Backup current members

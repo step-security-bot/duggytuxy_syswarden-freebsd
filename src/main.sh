@@ -64,6 +64,7 @@ if [[ "$MODE" == "fail2ban-jails" ]]; then
     echo -e "${BLUE}======================================================================${NC}"
 
     if [[ -f "$CONF_FILE" ]]; then
+        # shellcheck source=/dev/null
         source "$CONF_FILE"
         log "INFO" "Configuration loaded successfully."
     else
@@ -116,6 +117,7 @@ if [[ "$MODE" == "cron-update" ]]; then
     detect_os_backend
 
     if [[ -f "$CONF_FILE" ]]; then
+        # shellcheck source=/dev/null
         source "$CONF_FILE"
     else
         log "ERROR" "Config file missing. Aborting cron update."
@@ -164,6 +166,7 @@ chmod 600 "$CONF_FILE" 2>/dev/null || true
 chmod 640 "$LOG_FILE" 2>/dev/null || true
 
 if [[ "$MODE" == "update" ]] && [[ -f "$CONF_FILE" ]]; then
+    # shellcheck source=/dev/null
     source "$CONF_FILE"
 
     if ! grep -q "SYSWARDEN_ENABLE_WEBHOOK" "$CONF_FILE"; then
@@ -259,6 +262,7 @@ if [[ "$MODE" != "update" ]]; then
     setup_siem_logging "$MODE"
 
     if [[ -f "$CONF_FILE" ]]; then
+        # shellcheck source=/dev/null
         source "$CONF_FILE"
     fi
 
