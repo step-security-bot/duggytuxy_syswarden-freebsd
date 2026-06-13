@@ -13,9 +13,7 @@
 
   <br>
 
-  <a href="https://github.com/duggytuxy/syswarden-freebsd/actions/workflows/compliance.yml">
-    <img src="https://github.com/duggytuxy/syswarden-freebsd/actions/workflows/compliance.yml/badge.svg" alt="Plumber Compliance">
-  </a>
+  [![Plumber Compliance](https://github.com/duggytuxy/syswarden-freebsd/actions/workflows/compliance.yml/badge.svg?branch=main)](https://github.com/duggytuxy/syswarden-freebsd/actions/workflows/compliance.yml)
   <a href="https://github.com/duggytuxy/syswarden-freebsd/actions/workflows/scorecard.yml">
     <img src="https://github.com/duggytuxy/syswarden-freebsd/actions/workflows/scorecard.yml/badge.svg" alt="OSSF Scorecard Supply Chain Security">
   </a>
